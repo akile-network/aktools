@@ -126,9 +126,26 @@ get_nm_connection_name() {
 safe_write_resolv_conf() {
   local dns_ip="$1"
   local had_immutable=false
+  local had_symlink=""
+  local tmpfile=""
+
+  # 内部清理函数：失败时恢复状态
+  _swrc_cleanup() {
+    # 清理临时文件
+    [[ -n "$tmpfile" ]] && [[ -e "$tmpfile" ]] && rm -f "$tmpfile"
+    # 恢复 immutable
+    if $had_immutable && [[ -e /etc/resolv.conf ]]; then
+      chattr +i /etc/resolv.conf 2>/dev/null
+    fi
+    # 恢复被删的 symlink
+    if [[ -n "$had_symlink" ]] && [[ ! -e /etc/resolv.conf ]]; then
+      ln -sf "$had_symlink" /etc/resolv.conf 2>/dev/null
+      log_warn "已恢复 resolv.conf 符号链接 → $had_symlink"
+    fi
+  }
 
   # 检查 chattr 保护
-  if command -v lsattr &>/dev/null && [[ -e /etc/resolv.conf ]]; then
+  if command -v lsattr &>/dev/null && [[ -e /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
     local attrs
     attrs=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
     if [[ "$attrs" == *i* ]]; then
@@ -141,22 +158,23 @@ safe_write_resolv_conf() {
   # 检查 symlink 指向 systemd stub
   if [[ -L /etc/resolv.conf ]]; then
     local link_target
-    link_target=$(readlink -f /etc/resolv.conf 2>/dev/null)
-    if [[ "$link_target" == *"systemd"* ]] || [[ "$link_target" == *"stub"* ]]; then
+    link_target=$(readlink /etc/resolv.conf 2>/dev/null)
+    local link_resolved
+    link_resolved=$(readlink -f /etc/resolv.conf 2>/dev/null)
+    if [[ "$link_resolved" == *"systemd"* ]] || [[ "$link_resolved" == *"stub"* ]]; then
       log_warn "/etc/resolv.conf 是 systemd 符号链接，删除后直接写入"
+      had_symlink="$link_target"
       rm -f /etc/resolv.conf || { log_error "无法删除 resolv.conf 符号链接"; return 1; }
     fi
   fi
 
   # 使用 mktemp 在 /etc 下创建安全临时文件
-  local tmpfile
-  tmpfile=$(mktemp /etc/resolv.conf.akdns.XXXXXX) || { log_error "无法创建临时文件"; return 1; }
+  tmpfile=$(mktemp /etc/resolv.conf.akdns.XXXXXX) || { log_error "无法创建临时文件"; _swrc_cleanup; return 1; }
 
   # 确保临时文件不是符号链接
   if [[ -L "$tmpfile" ]]; then
-    rm -f "$tmpfile"
     log_error "临时文件安全检查失败"
-    return 1
+    _swrc_cleanup; return 1
   fi
 
   # 保留非 nameserver 行
@@ -165,9 +183,10 @@ safe_write_resolv_conf() {
   fi
   echo "nameserver $dns_ip" >> "$tmpfile"
 
-  # 原子替换
-  chmod 644 "$tmpfile" || { rm -f "$tmpfile"; log_error "无法设置临时文件权限"; return 1; }
-  mv -f "$tmpfile" /etc/resolv.conf || { rm -f "$tmpfile"; log_error "无法替换 resolv.conf"; return 1; }
+  # 原子替换（mv 可直接覆盖 symlink，无需先 rm）
+  chmod 644 "$tmpfile" || { log_error "无法设置临时文件权限"; _swrc_cleanup; return 1; }
+  mv -f "$tmpfile" /etc/resolv.conf || { log_error "无法替换 resolv.conf"; _swrc_cleanup; return 1; }
+  tmpfile=""  # mv 成功后不再需要清理
 
   # SELinux 上下文恢复
   if command -v restorecon &>/dev/null; then
@@ -539,13 +558,29 @@ do_restore() {
 
   # 还原 resolv.conf
   if [[ -f "$target_dir/resolv.conf" ]]; then
-    # 先移除现有的（可能是 symlink）
-    rm -f /etc/resolv.conf 2>/dev/null
+    local restore_had_immutable=false
+    # 检测并移除 immutable 标志
+    if command -v lsattr &>/dev/null && [[ -e /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
+      local rattrs
+      rattrs=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+      if [[ "$rattrs" == *i* ]]; then
+        log_info "检测到 resolv.conf immutable 标志，临时移除..."
+        chattr -i /etc/resolv.conf || { log_error "无法移除 immutable 标志，还原失败"; return 1; }
+        restore_had_immutable=true
+      fi
+    fi
+    # 移除现有的（可能是 symlink）
+    rm -f /etc/resolv.conf || { log_error "无法移除现有 resolv.conf"; return 1; }
     cp "$target_dir/resolv.conf" /etc/resolv.conf || { log_error "还原 resolv.conf 失败"; return 1; }
     chmod 644 /etc/resolv.conf
     # SELinux 上下文恢复
     if command -v restorecon &>/dev/null; then
       restorecon -F /etc/resolv.conf 2>/dev/null
+    fi
+    # 恢复 immutable（若原来有）
+    if $restore_had_immutable; then
+      chattr +i /etc/resolv.conf 2>/dev/null
+      log_info "已恢复 resolv.conf immutable 标志"
     fi
     log_info "已还原 /etc/resolv.conf"
   fi
@@ -553,24 +588,35 @@ do_restore() {
   case "$backend_perm_saved" in
     systemd-resolved)
       if [[ -f "$target_dir/resolved.conf" ]]; then
-        cp "$target_dir/resolved.conf" /etc/systemd/resolved.conf || log_warn "还原 resolved.conf 失败"
-        log_info "已还原 /etc/systemd/resolved.conf"
+        if cp "$target_dir/resolved.conf" /etc/systemd/resolved.conf; then
+          log_info "已还原 /etc/systemd/resolved.conf"
+        else
+          log_warn "还原 resolved.conf 失败"
+        fi
       fi
       # 还原 drop-in
       if [[ -d "$target_dir/resolved.conf.d" ]]; then
         mkdir -p /etc/systemd/resolved.conf.d
-        cp "$target_dir/resolved.conf.d/"* /etc/systemd/resolved.conf.d/ 2>/dev/null
+        # 使用 cp -a src/. dst/ 避免空目录/通配符问题
+        if cp -a "$target_dir/resolved.conf.d/." /etc/systemd/resolved.conf.d/ 2>/dev/null; then
+          log_info "已还原 resolved.conf.d drop-in"
+        else
+          log_warn "还原 resolved.conf.d drop-in 失败"
+        fi
         # 如果备份中没有 akdns.conf 但当前有，说明是还原到"无自定义DNS"状态
         if [[ ! -f "$target_dir/resolved.conf.d/akdns.conf" ]] && [[ -f /etc/systemd/resolved.conf.d/akdns.conf ]]; then
           rm -f /etc/systemd/resolved.conf.d/akdns.conf
         fi
-        log_info "已还原 resolved.conf.d drop-in"
       fi
       ;;
     networkmanager)
       if [[ -d "$target_dir/NetworkManager-conf.d" ]]; then
-        cp "$target_dir/NetworkManager-conf.d/"* /etc/NetworkManager/conf.d/ 2>/dev/null
-        log_info "已还原 NetworkManager 配置"
+        mkdir -p /etc/NetworkManager/conf.d
+        if cp -a "$target_dir/NetworkManager-conf.d/." /etc/NetworkManager/conf.d/ 2>/dev/null; then
+          log_info "已还原 NetworkManager 配置文件"
+        else
+          log_warn "还原 NetworkManager 配置文件失败"
+        fi
       fi
       if [[ -f "$target_dir/nm-connection-dns.txt" ]]; then
         local nm_uuid
@@ -580,24 +626,31 @@ do_restore() {
         local saved_ignore
         saved_ignore=$(grep '^ipv4.ignore-auto-dns:' "$target_dir/nm-connection-dns.txt" | cut -d: -f2-)
         if [[ -n "$nm_uuid" ]]; then
+          local nm_restore_ok=true
           if [[ -n "$saved_dns" ]] && [[ "$saved_dns" != " " ]] && [[ "$saved_dns" != "" ]]; then
-            nmcli con mod "$nm_uuid" ipv4.dns "$saved_dns" 2>/dev/null || log_warn "还原 NM DNS 设置失败"
+            nmcli con mod "$nm_uuid" ipv4.dns "$saved_dns" 2>/dev/null || { log_warn "还原 NM DNS 设置失败"; nm_restore_ok=false; }
           else
-            nmcli con mod "$nm_uuid" ipv4.dns "" 2>/dev/null
+            nmcli con mod "$nm_uuid" ipv4.dns "" 2>/dev/null || nm_restore_ok=false
           fi
           if [[ "$saved_ignore" == "yes" ]]; then
             nmcli con mod "$nm_uuid" ipv4.ignore-auto-dns yes 2>/dev/null
           else
             nmcli con mod "$nm_uuid" ipv4.ignore-auto-dns no 2>/dev/null
           fi
-          log_info "已还原 NetworkManager 连接 DNS 设置 (UUID: $nm_uuid)"
+          if $nm_restore_ok; then
+            log_info "已还原 NetworkManager 连接 DNS 设置 (UUID: $nm_uuid)"
+          fi
         fi
       fi
       ;;
     netplan)
       if [[ -d "$target_dir/netplan" ]]; then
-        cp "$target_dir/netplan/"*.yaml /etc/netplan/ 2>/dev/null || log_warn "还原 netplan 配置失败"
-        log_info "已还原 netplan 配置"
+        mkdir -p /etc/netplan
+        if cp -a "$target_dir/netplan/." /etc/netplan/ 2>/dev/null; then
+          log_info "已还原 netplan 配置"
+        else
+          log_warn "还原 netplan 配置失败"
+        fi
       fi
       ;;
   esac
@@ -754,17 +807,36 @@ apply_perm() {
       # 先验证配置有效性
       if command -v netplan &>/dev/null; then
         if ! netplan generate 2>/dev/null; then
-          log_error "netplan 配置验证失败，请检查 $yaml_file"
-          log_warn "建议手动检查并修复 YAML 格式"
+          log_error "netplan 配置验证失败，正在回滚..."
+          # 从 pre-apply 备份恢复 YAML
+          local latest_backup
+          latest_backup=$(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -name '*_pre-apply*' | sort -r | head -1)
+          if [[ -d "$latest_backup/netplan" ]]; then
+            cp "$latest_backup/netplan/"*.yaml /etc/netplan/ 2>/dev/null
+            log_info "已从备份回滚 netplan 配置"
+          fi
           return 1
         fi
       fi
 
-      # 使用 netplan try（带自动回滚）优先于 netplan apply
-      if netplan try --timeout 10 2>/dev/null; then
-        log_success "netplan 配置已应用并确认"
+      # 判断系统是否支持 netplan try
+      local has_netplan_try=false
+      if netplan try --help &>/dev/null 2>&1; then
+        has_netplan_try=true
+      fi
+
+      if $has_netplan_try; then
+        # netplan try 带自动回滚：超时/拒绝时 netplan 自动恢复原配置
+        if netplan try --timeout 30 2>/dev/null; then
+          log_success "netplan 配置已应用并确认"
+        else
+          # try 失败/超时/拒绝 → netplan 已自动回滚，不要执行 apply
+          log_error "netplan try 失败或未确认，配置已自动回滚"
+          return 1
+        fi
       else
-        log_warn "netplan try 不可用或超时，使用 netplan apply..."
+        # 系统不支持 try，只能用 apply
+        log_warn "当前系统不支持 netplan try，直接应用..."
         if ! netplan apply; then
           log_error "netplan apply 失败"
           return 1
@@ -851,7 +923,6 @@ run_speed_test() {
 
   local tmpdir
   tmpdir=$(mktemp -d) || { log_error "无法创建临时目录"; return 1; }
-  trap 'rm -rf "$tmpdir"' RETURN
 
   echo ""
   printf '%b\n' "${BOLD}AKDNS 测速${NC}"
@@ -884,6 +955,7 @@ run_speed_test() {
 
   if [[ ! -s "$tmpdir/result" ]]; then
     log_error "测速失败，未获取到任何结果"
+    rm -rf "$tmpdir"
     return 1
   fi
 
@@ -913,6 +985,8 @@ run_speed_test() {
   printf '%b\n' "  最佳 DNS: ${GREEN}${BOLD}$BEST_DNS${NC}"
   echo ""
   log_info "可选择菜单 2 或 3 来应用此 DNS"
+
+  rm -rf "$tmpdir"
 }
 
 # ============================================================
@@ -1004,6 +1078,18 @@ menu_apply() {
 }
 
 # ============================================================
+# 流媒体解锁检测
+# ============================================================
+
+run_unlock_check() {
+  log_info "正在下载并运行流媒体解锁检测脚本..."
+  echo ""
+  bash <(curl -L -s https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh) -M 4
+  echo ""
+  log_info "解锁检测完成"
+}
+
+# ============================================================
 # 状态查看
 # ============================================================
 
@@ -1079,6 +1165,7 @@ show_menu() {
   printf '%b\n' "  ${GREEN}4)${NC} 备份当前 DNS 配置"
   printf '%b\n' "  ${GREEN}5)${NC} 还原 DNS 配置"
   printf '%b\n' "  ${GREEN}6)${NC} 查看当前状态"
+  printf '%b\n' "  ${GREEN}7)${NC} 流媒体解锁检测"
   printf '%b\n' "  ${RED}0)${NC} 退出"
   echo ""
 }
@@ -1126,7 +1213,7 @@ main() {
     show_banner
     show_menu
     local choice
-    read -r -p " 请选择 [0-6]: " choice
+    read -r -p " 请选择 [0-7]: " choice
     case "$choice" in
       1) run_speed_test ;;
       2) menu_apply temp ;;
@@ -1136,13 +1223,14 @@ main() {
         ;;
       5) do_restore ;;
       6) show_status ;;
+      7) run_unlock_check ;;
       0)
         clear
         log_info "再见！"
         exit 0
         ;;
       *)
-        log_warn "无效选择，请输入 0-6"
+        log_warn "无效选择，请输入 0-7"
         ;;
     esac
     press_enter
