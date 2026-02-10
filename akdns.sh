@@ -548,7 +548,10 @@ do_restore() {
 
   # 还原前自动备份当前状态
   log_info "还原前自动备份当前配置..."
-  do_backup "pre-restore"
+  if ! do_backup "pre-restore"; then
+    log_error "备份当前配置失败，为安全起见中止还原"
+    return 1
+  fi
 
   # 读取目标备份的后端信息
   local backend_perm_saved="resolv.conf"
@@ -659,9 +662,11 @@ do_restore() {
   reload_dns_service "$backend_perm_saved"
 
   # 验证还原结果
-  verify_system_dns
-
-  log_success "DNS 配置已还原"
+  if verify_system_dns; then
+    log_success "DNS 配置已还原并验证通过"
+  else
+    log_warn "DNS 配置已还原，但验证未通过，请手动检查"
+  fi
 }
 
 reload_dns_service() {
@@ -924,6 +929,9 @@ run_speed_test() {
   local tmpdir
   tmpdir=$(mktemp -d) || { log_error "无法创建临时目录"; return 1; }
 
+  # 确保中断/退出时清理临时目录和子进程
+  trap 'rm -rf "$tmpdir"; kill 0 2>/dev/null' RETURN
+
   echo ""
   printf '%b\n' "${BOLD}AKDNS 测速${NC}"
   echo "域名   : $DOMAIN"
@@ -979,14 +987,24 @@ run_speed_test() {
 
   echo "$result" | awk '{printf "  %s ms\t%s\n", $1, $2}'
 
-  BEST_DNS=$(echo "$result" | head -n1 | awk '{print $2}')
+  # 检查最佳 DNS 是否全部超时（avg >= 1000 表示全部失败）
+  local best_avg best_dns
+  best_avg=$(echo "$result" | head -n1 | awk '{print $1}')
+  best_dns=$(echo "$result" | head -n1 | awk '{print $2}')
+
+  if [[ -z "$best_dns" ]] || (( best_avg >= 1000 )); then
+    echo "------------------------------------"
+    log_error "所有 DNS 测速均超时，未能选出可用 DNS"
+    BEST_DNS=""
+    return 1
+  fi
+
+  BEST_DNS="$best_dns"
 
   echo "------------------------------------"
-  printf '%b\n' "  最佳 DNS: ${GREEN}${BOLD}$BEST_DNS${NC}"
+  printf '%b\n' "  最佳 DNS: ${GREEN}${BOLD}$BEST_DNS${NC} (${best_avg}ms)"
   echo ""
   log_info "可选择菜单 2 或 3 来应用此 DNS"
-
-  rm -rf "$tmpdir"
 }
 
 # ============================================================
@@ -1052,7 +1070,10 @@ menu_apply() {
 
   # 自动备份
   log_info "自动备份当前配置..."
-  do_backup "pre-apply-${mode}"
+  if ! do_backup "pre-apply-${mode}"; then
+    log_error "备份当前配置失败，为安全起见中止应用"
+    return 1
+  fi
 
   # 执行应用
   if [[ "$mode" == "temp" ]]; then
@@ -1082,11 +1103,46 @@ menu_apply() {
 # ============================================================
 
 run_unlock_check() {
-  log_info "正在下载并运行流媒体解锁检测脚本..."
+  if ! command -v curl &>/dev/null; then
+    log_error "未找到 curl 命令，无法下载解锁检测脚本"
+    case "$DISTRO_ID" in
+      ubuntu|debian)   log_info "请安装: sudo apt install curl" ;;
+      centos|rhel|fedora|rocky|alma) log_info "请安装: sudo yum install curl" ;;
+      arch|manjaro)    log_info "请安装: sudo pacman -S curl" ;;
+      alpine)          log_info "请安装: sudo apk add curl" ;;
+      *)               log_info "请安装 curl" ;;
+    esac
+    return 1
+  fi
+
+  local script_url="https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh"
+  local tmp_script
+  tmp_script=$(mktemp /tmp/akdns-unlock-check.XXXXXX) || { log_error "无法创建临时文件"; return 1; }
+
+  # 确保退出时清理临时文件
+  trap 'rm -f "$tmp_script"' RETURN
+
+  log_info "正在下载解锁检测脚本..."
+  if ! curl -L -s --fail --connect-timeout 10 --max-time 30 "$script_url" -o "$tmp_script"; then
+    log_error "下载解锁检测脚本失败，请检查网络连接"
+    return 1
+  fi
+
+  # 验证下载内容非空
+  if [[ ! -s "$tmp_script" ]]; then
+    log_error "下载的脚本内容为空"
+    return 1
+  fi
+
   echo ""
-  bash <(curl -L -s https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh) -M 4
+  bash "$tmp_script" -M 4
+  local exit_code=$?
   echo ""
-  log_info "解锁检测完成"
+  if [[ $exit_code -eq 0 ]]; then
+    log_success "解锁检测完成"
+  else
+    log_warn "解锁检测脚本退出码: $exit_code"
+  fi
 }
 
 # ============================================================
@@ -1207,6 +1263,18 @@ main() {
   detect_distro
   detect_init_system
   detect_dns_backend
+
+  # 支持 wget ... | bash 管道调用：将 stdin 重定向回终端
+  # 管道模式下 stdin 是脚本内容，read 无法获取用户输入
+  if [[ ! -t 0 ]]; then
+    if [[ -e /dev/tty ]]; then
+      exec < /dev/tty || { log_error "无法获取终端输入，请改用: bash <(wget -qO- URL)"; exit 1; }
+    else
+      log_error "未检测到可用终端，无法进入交互模式"
+      log_info "请直接运行脚本文件: bash akdns.sh"
+      exit 1
+    fi
+  fi
 
   while true; do
     clear
