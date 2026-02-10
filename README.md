@@ -7,7 +7,7 @@
 
 ![设置前](https://github.com/user-attachments/assets/ee8ee5e8-08c6-4b06-a4fe-e8185b1cc355)
 
-这里发现这台机器不能看访问谷歌服务，现在添加机器的ip到AKDNS面板，然后配置一下解锁谷歌服务
+这里发现这台机器不能看访问谷歌服务，现在添加机器的ip到AKDNS[https://dns.akile.ai](https://dns.akile.ai)面板，然后配置一下解锁谷歌服务
 
 ![网站设置](https://github.com/user-attachments/assets/5a02bd33-c83a-4bfc-a5cd-a976489a3afa)
 
