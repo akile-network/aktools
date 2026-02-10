@@ -277,13 +277,15 @@ detect_dns_backend() {
   fi
 
   # 检测 systemd-resolved
-  if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active systemd-resolved &>/dev/null; then
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl &>/dev/null \
+      && systemctl is-active systemd-resolved &>/dev/null; then
     has_resolved=true
   fi
 
   # 检测 NetworkManager
   if command -v nmcli &>/dev/null; then
-    if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active NetworkManager &>/dev/null; then
+    if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl &>/dev/null \
+        && systemctl is-active NetworkManager &>/dev/null; then
       has_nm=true
     elif nmcli general status &>/dev/null 2>&1; then
       has_nm=true
@@ -333,19 +335,21 @@ get_current_dns() {
 
   case "$DNS_BACKEND_TEMP" in
     systemd-resolved)
-      # 优先使用默认路由接口获取精确 DNS
-      local iface
-      iface=$(get_primary_interface)
-      if [[ -n "$iface" ]]; then
-        dns_servers=$(resolvectl dns "$iface" 2>/dev/null \
-          | awk '{for(i=2;i<=NF;i++) if($i ~ /^[0-9]+\./) printf "%s ", $i}')
-      fi
-      # 回退：全局解析
-      if [[ -z "$dns_servers" ]]; then
-        dns_servers=$(resolvectl status 2>/dev/null \
-          | grep -E "DNS Servers|DNS 服务器" \
-          | head -3 \
-          | awk '{for(i=NF;i>=1;i--) if($i ~ /^[0-9]+\./) {printf "%s ", $i; break}}')
+      if command -v resolvectl &>/dev/null; then
+        # 优先使用默认路由接口获取精确 DNS
+        local iface
+        iface=$(get_primary_interface)
+        if [[ -n "$iface" ]]; then
+          dns_servers=$(resolvectl dns "$iface" 2>/dev/null \
+            | awk '{for(i=2;i<=NF;i++) if($i ~ /^[0-9]+\./) printf "%s ", $i}')
+        fi
+        # 回退：全局解析
+        if [[ -z "$dns_servers" ]]; then
+          dns_servers=$(resolvectl status 2>/dev/null \
+            | grep -E "DNS Servers|DNS 服务器" \
+            | head -3 \
+            | awk '{for(i=NF;i>=1;i--) if($i ~ /^[0-9]+\./) {printf "%s ", $i; break}}')
+        fi
       fi
       ;;
     networkmanager)
@@ -674,9 +678,13 @@ reload_dns_service() {
 
   case "$backend" in
     systemd-resolved)
-      log_info "重启 systemd-resolved..."
-      if ! systemctl restart systemd-resolved; then
-        log_warn "systemd-resolved 重启失败"
+      if ! command -v systemctl &>/dev/null; then
+        log_warn "systemctl 不可用，无法重启 systemd-resolved"
+      else
+        log_info "重启 systemd-resolved..."
+        if ! systemctl restart systemd-resolved; then
+          log_warn "systemd-resolved 重启失败"
+        fi
       fi
       ;;
     networkmanager)
@@ -929,8 +937,8 @@ run_speed_test() {
   local tmpdir
   tmpdir=$(mktemp -d) || { log_error "无法创建临时目录"; return 1; }
 
-  # 确保中断/退出时清理临时目录和子进程
-  trap 'rm -rf "$tmpdir"; kill 0 2>/dev/null' RETURN
+  # 确保函数退出时清理临时目录
+  trap 'rm -rf "$tmpdir"' RETURN
 
   echo ""
   printf '%b\n' "${BOLD}AKDNS 测速${NC}"
