@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================
-# AKDNS v2.0.0 - 智能 DNS 测速与管理工具
-# 支持 Linux 系统识别、DNS 自动应用、备份与还原
+# AKDNS v3.0.0 - 智能 DNS 测速与系统接管工具
+# 测试 DNS 连通性 → 选出最优 AKDNS → 接管系统 DNS
+# 不论 netplan / systemd-resolved / NetworkManager / resolvconf，
+# 一律收敛为「直接读取 /etc/resolv.conf」，确保解锁一定生效。
+# 支持 Linux 系统识别、自动备份与一键还原。
 # ============================================================
 
 set -uo pipefail
 
 # ---- 全局常量 ----
-VERSION="2.0.0"
+VERSION="3.0.0"
 BACKUP_DIR="/var/lib/akdns/backup"
 DOMAIN="www.google.com"
 COUNT=5
 TIMEOUT=1
+
+# 接管后是否对 /etc/resolv.conf 加 chattr +i 锁定，
+# 杜绝 dhclient / cloud-init / 网络管理器在重启或续租时覆盖。
+# 还原（菜单「还原 DNS 配置」）会自动解锁。
+LOCK_RESOLV_CONF=true
+
+# AKDNS 控制台地址（用于脚本内提示，部署时请改成你的实际域名）
+CONSOLE_URL="https://akdns.akile.io/console"
 
 DNS_LIST=(
   "66.66.66.66"
@@ -204,6 +215,113 @@ safe_write_resolv_conf() {
   if ! grep -q "^nameserver $dns_ip" /etc/resolv.conf 2>/dev/null; then
     log_error "resolv.conf 写入验证失败"
     return 1
+  fi
+
+  return 0
+}
+
+# ============================================================
+# 系统 DNS 接管（统一收敛为 /etc/resolv.conf）
+# ============================================================
+
+# 锁定 / 解锁 resolv.conf（immutable），防止被其他程序覆盖
+lock_resolv_conf() {
+  command -v chattr &>/dev/null || return 0
+  [[ -e /etc/resolv.conf ]] || return 0
+  [[ -L /etc/resolv.conf ]] && return 0   # 符号链接不锁定
+  if chattr +i /etc/resolv.conf 2>/dev/null; then
+    log_info "已锁定 /etc/resolv.conf（防止被覆盖；还原时会自动解锁）"
+  fi
+}
+
+unlock_resolv_conf() {
+  command -v chattr &>/dev/null || return 0
+  [[ -e /etc/resolv.conf ]] || return 0
+  [[ -L /etc/resolv.conf ]] && return 0
+  local attrs
+  attrs=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+  if [[ "$attrs" == *i* ]]; then
+    chattr -i /etc/resolv.conf 2>/dev/null && log_info "已解除 /etc/resolv.conf 锁定"
+  fi
+}
+
+# 确保 NSS 主机解析链路包含 dns，否则停用 resolved 后 resolv.conf 不会被查询
+ensure_nsswitch_dns() {
+  local f="/etc/nsswitch.conf"
+  [[ -f "$f" ]] || return 0
+  local line
+  line=$(grep -E '^[[:space:]]*hosts:' "$f" 2>/dev/null | head -1)
+  [[ -z "$line" ]] && return 0
+  # 已包含 dns 则无需处理
+  if echo "$line" | grep -qw 'dns'; then
+    return 0
+  fi
+  log_info "nsswitch.conf 缺少 dns，自动补充以确保读取 resolv.conf..."
+  cp -a "$f" "$f.akdns.bak" 2>/dev/null
+  # 在 hosts: 行末尾追加 dns
+  sed -i -E 's/^([[:space:]]*hosts:.*)$/\1 dns/' "$f"
+}
+
+# 停用所有可能改写 resolv.conf 的 DNS 管理器，让系统直接读取静态 resolv.conf
+neutralize_dns_managers() {
+  # 1) systemd-resolved：停止并禁用（其 stub 127.0.0.53 会拦截解析）
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl &>/dev/null; then
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null \
+        || systemctl is-enabled --quiet systemd-resolved 2>/dev/null; then
+      log_info "停用 systemd-resolved（接管 DNS）..."
+      systemctl disable --now systemd-resolved 2>/dev/null \
+        || log_warn "停用 systemd-resolved 失败，将依赖 resolv.conf 锁定兜底"
+    fi
+  fi
+
+  # 2) NetworkManager：令其不再管理 resolv.conf（dns=none），但不停用网络
+  if command -v nmcli &>/dev/null \
+      && { systemctl is-active --quiet NetworkManager 2>/dev/null || nmcli general status &>/dev/null 2>&1; }; then
+    if [[ -d /etc/NetworkManager ]]; then
+      mkdir -p /etc/NetworkManager/conf.d
+      cat > /etc/NetworkManager/conf.d/akdns-dns.conf << 'EOF'
+# 由 AKDNS 写入：让 NetworkManager 不再覆盖 /etc/resolv.conf
+[main]
+dns=none
+EOF
+      chmod 644 /etc/NetworkManager/conf.d/akdns-dns.conf
+      log_info "已让 NetworkManager 放手 resolv.conf (dns=none)"
+      systemctl reload NetworkManager 2>/dev/null \
+        || nmcli general reload 2>/dev/null || true
+    fi
+  fi
+
+  # 3) resolvconf / openresolv：停用其服务，避免重新生成
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v systemctl &>/dev/null \
+      && systemctl is-active --quiet resolvconf 2>/dev/null; then
+    log_info "停用 resolvconf 服务..."
+    systemctl disable --now resolvconf 2>/dev/null || true
+  fi
+
+  # 4) 确保 NSS 解析链路会查询 resolv.conf
+  ensure_nsswitch_dns
+}
+
+# 核心：不论原后端是什么，统一接管为静态 /etc/resolv.conf 并写入指定 DNS
+force_static_resolv_conf() {
+  local dns_ip="$1"
+  log_info "接管系统 DNS：统一改为直接读取 /etc/resolv.conf..."
+
+  # 若此前已锁定，先解锁以便写入
+  unlock_resolv_conf
+
+  # 停用各类 DNS 管理器
+  neutralize_dns_managers
+
+  # 写入静态 resolv.conf（safe_write 会移除 systemd 符号链接并原子替换）
+  if ! safe_write_resolv_conf "$dns_ip"; then
+    log_error "写入 resolv.conf 失败"
+    return 1
+  fi
+
+  # 锁定，杜绝 dhclient / cloud-init / 管理器在续租或重启时覆盖
+  if $LOCK_RESOLV_CONF; then
+    lock_resolv_conf
   fi
 
   return 0
@@ -457,6 +575,24 @@ do_backup() {
       ;;
   esac
 
+  # 记录 DNS 管理器状态（供还原时撤销接管）
+  local resolved_active=no resolved_enabled=no nm_active=no resolvconf_active=no
+  if command -v systemctl &>/dev/null; then
+    systemctl is-active  --quiet systemd-resolved 2>/dev/null && resolved_active=yes
+    systemctl is-enabled --quiet systemd-resolved 2>/dev/null && resolved_enabled=yes
+    systemctl is-active  --quiet resolvconf       2>/dev/null && resolvconf_active=yes
+  fi
+  if command -v nmcli &>/dev/null \
+      && { systemctl is-active --quiet NetworkManager 2>/dev/null || nmcli general status &>/dev/null 2>&1; }; then
+    nm_active=yes
+  fi
+
+  # 备份 nsswitch.conf（接管可能会补充 dns）
+  if [[ -f /etc/nsswitch.conf ]]; then
+    cp -a /etc/nsswitch.conf "$backup_path/nsswitch.conf"
+    backed_up+=("/etc/nsswitch.conf")
+  fi
+
   # 写入元数据
   {
     echo "timestamp=$timestamp"
@@ -466,6 +602,10 @@ do_backup() {
     echo "backend_temp=$DNS_BACKEND_TEMP"
     echo "backend_perm=$DNS_BACKEND_PERM"
     echo "dns_servers=$(get_current_dns)"
+    echo "resolved_active=$resolved_active"
+    echo "resolved_enabled=$resolved_enabled"
+    echo "nm_active=$nm_active"
+    echo "resolvconf_active=$resolvconf_active"
     echo "files=${backed_up[*]}"
   } > "$backup_path/metadata.txt"
 
@@ -558,10 +698,20 @@ do_restore() {
     return 1
   fi
 
-  # 读取目标备份的后端信息
+  # 读取目标备份的后端信息与 DNS 管理器状态
   local backend_perm_saved="resolv.conf"
+  local resolved_active_saved="no" resolved_enabled_saved="no" resolvconf_active_saved="no"
   if [[ -f "$target_dir/metadata.txt" ]]; then
     backend_perm_saved=$(grep '^backend_perm=' "$target_dir/metadata.txt" | cut -d= -f2-)
+    resolved_active_saved=$(grep '^resolved_active=' "$target_dir/metadata.txt" | cut -d= -f2-)
+    resolved_enabled_saved=$(grep '^resolved_enabled=' "$target_dir/metadata.txt" | cut -d= -f2-)
+    resolvconf_active_saved=$(grep '^resolvconf_active=' "$target_dir/metadata.txt" | cut -d= -f2-)
+  fi
+
+  # 撤销接管：移除 AKDNS 写入的 NetworkManager dns=none 配置
+  if [[ -f /etc/NetworkManager/conf.d/akdns-dns.conf ]]; then
+    rm -f /etc/NetworkManager/conf.d/akdns-dns.conf
+    log_info "已移除 AKDNS 的 NetworkManager dns=none 配置"
   fi
 
   # 还原 resolv.conf
@@ -577,19 +727,28 @@ do_restore() {
         restore_had_immutable=true
       fi
     fi
-    # 移除现有的（可能是 symlink）
+    # 移除现有的（可能是 symlink，或接管时写入的静态文件）
     rm -f /etc/resolv.conf || { log_error "无法移除现有 resolv.conf"; return 1; }
-    cp "$target_dir/resolv.conf" /etc/resolv.conf || { log_error "还原 resolv.conf 失败"; return 1; }
-    chmod 644 /etc/resolv.conf
-    # SELinux 上下文恢复
-    if command -v restorecon &>/dev/null; then
-      restorecon -F /etc/resolv.conf 2>/dev/null
+    # 若原本是符号链接（如 systemd-resolved 的 stub），优先恢复符号链接本身
+    if [[ -f "$target_dir/resolv.conf.symlink" ]]; then
+      local _symlink_target
+      _symlink_target=$(cat "$target_dir/resolv.conf.symlink" 2>/dev/null)
+      if [[ -n "$_symlink_target" ]]; then
+        ln -sf "$_symlink_target" /etc/resolv.conf \
+          && log_info "已恢复 resolv.conf 符号链接 → $_symlink_target"
+      fi
     fi
-    # 恢复 immutable（若原来有）
-    if $restore_had_immutable; then
-      chattr +i /etc/resolv.conf 2>/dev/null
-      log_info "已恢复 resolv.conf immutable 标志"
+    # 非符号链接场景：恢复静态文件内容
+    if [[ ! -L /etc/resolv.conf ]]; then
+      cp "$target_dir/resolv.conf" /etc/resolv.conf || { log_error "还原 resolv.conf 失败"; return 1; }
+      chmod 644 /etc/resolv.conf
+      # SELinux 上下文恢复
+      if command -v restorecon &>/dev/null; then
+        restorecon -F /etc/resolv.conf 2>/dev/null
+      fi
     fi
+    # 注意：还原的目的是撤销接管，这里不再重新加 immutable 锁
+    # （接管时加的锁已在上面移除；如需手动锁定可自行执行 chattr +i）
     log_info "已还原 /etc/resolv.conf"
   fi
 
@@ -662,6 +821,25 @@ do_restore() {
       fi
       ;;
   esac
+
+  # 撤销接管：还原 nsswitch.conf
+  if [[ -f "$target_dir/nsswitch.conf" ]]; then
+    cp -a "$target_dir/nsswitch.conf" /etc/nsswitch.conf 2>/dev/null \
+      && log_info "已还原 /etc/nsswitch.conf"
+  fi
+
+  # 撤销接管：重新启用此前被停用的 DNS 管理器
+  if command -v systemctl &>/dev/null; then
+    if [[ "$resolved_enabled_saved" == "yes" ]] || [[ "$resolved_active_saved" == "yes" ]]; then
+      log_info "重新启用 systemd-resolved..."
+      systemctl enable systemd-resolved 2>/dev/null || true
+      systemctl start  systemd-resolved 2>/dev/null || log_warn "systemd-resolved 启动失败，请手动检查"
+    fi
+    if [[ "$resolvconf_active_saved" == "yes" ]]; then
+      log_info "重新启用 resolvconf..."
+      systemctl enable --now resolvconf 2>/dev/null || true
+    fi
+  fi
 
   # 重载服务
   reload_dns_service "$backend_perm_saved"
@@ -782,137 +960,15 @@ apply_temp() {
 apply_perm() {
   local dns_ip="$1"
 
-  case "$DNS_BACKEND_PERM" in
-    netplan)
-      log_info "通过 netplan 永久设置 DNS..."
-      local yaml_file
-      yaml_file=$(find /etc/netplan -maxdepth 1 -name '*.yaml' -print -quit 2>/dev/null)
-      if [[ -z "$yaml_file" ]]; then
-        log_error "未找到 netplan 配置文件"
-        return 1
-      fi
+  # v3.0.0 起：不再分后端各写各的（netplan / systemd-resolved / NetworkManager）。
+  # 无论系统原本用什么 DNS 管理器，一律停用它们并接管为「静态 /etc/resolv.conf」，
+  # 这样系统所有解析都直接走指定的 AKDNS，确保流媒体解锁一定生效。
+  # 原配置已在调用前完整备份，可随时通过菜单「还原 DNS 配置」一键回滚。
+  if [[ "$DNS_BACKEND_PERM" != "resolv.conf" ]]; then
+    log_info "检测到 DNS 后端: $DNS_BACKEND_PERM → 将接管为 /etc/resolv.conf"
+  fi
 
-      # 检查 yaml 复杂度
-      local iface_count
-      iface_count=$(grep -Ec 'ethernets|wifis|bonds|bridges|vlans' "$yaml_file" 2>/dev/null) || iface_count=0
-      if (( iface_count > 2 )); then
-        log_warn "检测到复杂网络拓扑 ($yaml_file)，建议手动编辑"
-        log_info "请在对应接口下添加:"
-        echo "      nameservers:"
-        echo "        addresses: [$dns_ip]"
-        return 1
-      fi
-
-      # 使用 sed 处理 netplan yaml
-      if grep -q 'nameservers:' "$yaml_file"; then
-        sed -i -E "/nameservers:/,/addresses:/ s/(addresses:).*/\1 [$dns_ip]/" "$yaml_file"
-      else
-        if grep -q 'dhcp4:' "$yaml_file"; then
-          sed -i "/dhcp4:/a\\            nameservers:\\n                addresses: [$dns_ip]" "$yaml_file"
-        else
-          log_warn "无法自动修改 netplan 配置，请手动编辑 $yaml_file"
-          log_info "在对应接口下添加:"
-          echo "      nameservers:"
-          echo "        addresses: [$dns_ip]"
-          return 1
-        fi
-      fi
-
-      # 先验证配置有效性
-      if command -v netplan &>/dev/null; then
-        if ! netplan generate 2>/dev/null; then
-          log_error "netplan 配置验证失败，正在回滚..."
-          # 从 pre-apply 备份恢复 YAML
-          local latest_backup
-          latest_backup=$(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -name '*_pre-apply*' | sort -r | head -1)
-          if [[ -d "$latest_backup/netplan" ]]; then
-            cp "$latest_backup/netplan/"*.yaml /etc/netplan/ 2>/dev/null
-            log_info "已从备份回滚 netplan 配置"
-          fi
-          return 1
-        fi
-      fi
-
-      # 判断系统是否支持 netplan try
-      local has_netplan_try=false
-      if netplan try --help &>/dev/null 2>&1; then
-        has_netplan_try=true
-      fi
-
-      if $has_netplan_try; then
-        # netplan try 带自动回滚：超时/拒绝时 netplan 自动恢复原配置
-        if netplan try --timeout 30 2>/dev/null; then
-          log_success "netplan 配置已应用并确认"
-        else
-          # try 失败/超时/拒绝 → netplan 已自动回滚，不要执行 apply
-          log_error "netplan try 失败或未确认，配置已自动回滚"
-          return 1
-        fi
-      else
-        # 系统不支持 try，只能用 apply
-        log_warn "当前系统不支持 netplan try，直接应用..."
-        if ! netplan apply; then
-          log_error "netplan apply 失败"
-          return 1
-        fi
-      fi
-      ;;
-    systemd-resolved)
-      log_info "通过 systemd-resolved 永久设置 DNS..."
-      # 使用 drop-in 文件而非修改主配置（更安全、更规范）
-      local dropin_dir="/etc/systemd/resolved.conf.d"
-      mkdir -p "$dropin_dir" || { log_error "无法创建 drop-in 目录"; return 1; }
-
-      local dropin_file="$dropin_dir/akdns.conf"
-      cat > "$dropin_file" << EOF
-[Resolve]
-DNS=$dns_ip
-EOF
-      if [[ $? -ne 0 ]]; then
-        log_error "写入 resolved drop-in 失败"
-        return 1
-      fi
-      chmod 644 "$dropin_file"
-
-      if ! systemctl restart systemd-resolved; then
-        log_error "systemd-resolved 重启失败"
-        # 回滚：删除 drop-in
-        rm -f "$dropin_file"
-        systemctl restart systemd-resolved 2>/dev/null
-        return 1
-      fi
-      ;;
-    networkmanager)
-      log_info "通过 NetworkManager 永久设置 DNS..."
-      local uuid
-      uuid=$(get_active_nm_connection_uuid)
-      if [[ -z "$uuid" ]]; then
-        log_error "未找到活动的 NetworkManager 连接"
-        return 1
-      fi
-      local conn_name
-      conn_name=$(get_nm_connection_name "$uuid")
-      log_info "修改连接: ${conn_name:-$uuid}"
-      if ! nmcli con mod "$uuid" ipv4.dns "$dns_ip"; then
-        log_error "nmcli 设置 DNS 失败"
-        return 1
-      fi
-      if ! nmcli con mod "$uuid" ipv4.ignore-auto-dns yes; then
-        log_warn "设置 ignore-auto-dns 失败"
-      fi
-      if ! nmcli con up "$uuid" 2>/dev/null; then
-        log_warn "重新激活连接失败，DNS 设置将在下次连接时生效"
-      fi
-      ;;
-    resolv.conf)
-      log_info "直接修改 /etc/resolv.conf (永久)..."
-      if ! safe_write_resolv_conf "$dns_ip"; then
-        log_error "写入 resolv.conf 失败"
-        return 1
-      fi
-      log_info "提示: 可执行 'chattr +i /etc/resolv.conf' 防止被其他程序覆盖"
-      ;;
-  esac
+  force_static_resolv_conf "$dns_ip" || return 1
 
   return 0
 }
@@ -977,7 +1033,7 @@ run_speed_test() {
   fi
 
   echo ""
-  printf '%b\n' "${BOLD}平均响应时间:${NC}"
+  printf '%b\n' "${BOLD}AKDNS 节点连通性 / 平均延迟:${NC}"
   echo "------------------------------------"
 
   local result
@@ -994,7 +1050,11 @@ run_speed_test() {
   }
   ' "$tmpdir/result" | sort -n)
 
-  echo "$result" | awk '{printf "  %s ms\t%s\n", $1, $2}'
+  # avg>=1000 视为该次全部超时，标记为不可达
+  echo "$result" | awk '{
+    if ($1 + 0 >= 1000) printf "  %-18s %s\n", $2, "超时 / 不可达 ✗";
+    else                printf "  %-18s %s ms  ✓\n", $2, $1;
+  }'
 
   # 检查最佳 DNS 是否全部超时（avg >= 1000 表示全部失败）
   local best_avg best_dns
@@ -1067,7 +1127,18 @@ menu_apply() {
   printf '%b\n' "${BOLD}操作摘要:${NC}"
   echo "  模式   : ${mode_name}应用"
   echo "  DNS    : $target_dns"
-  echo "  后端   : $([ "$mode" == "temp" ] && echo "$DNS_BACKEND_TEMP" || echo "$DNS_BACKEND_PERM")"
+  if [[ "$mode" == "temp" ]]; then
+    echo "  后端   : $DNS_BACKEND_TEMP（重启后失效）"
+  else
+    echo "  当前后端 : $DNS_BACKEND_PERM"
+    echo "  接管方式 : 停用上述管理器 → 直接写入 /etc/resolv.conf"
+    if $LOCK_RESOLV_CONF; then
+      echo "  防覆盖   : 锁定 /etc/resolv.conf (chattr +i)"
+    fi
+    echo ""
+    printf '%b\n' "  ${YELLOW}说明：将统一接管系统 DNS，确保解析直达 AKDNS。${NC}"
+    printf '%b\n' "  ${YELLOW}原配置会自动备份，可随时用菜单「还原 DNS 配置」一键回滚。${NC}"
+  fi
   echo ""
 
   if ! confirm_action "确认${mode_name}应用 DNS $target_dns?"; then
@@ -1105,6 +1176,18 @@ menu_apply() {
   fi
 
   return $exit_code
+}
+
+# 一键：测速选最优 → 接管为系统 DNS（步骤③+④串联）
+run_test_and_apply() {
+  run_speed_test || return 1
+  if [[ -z "$BEST_DNS" ]]; then
+    log_error "未选出可用 DNS，已中止"
+    return 1
+  fi
+  echo ""
+  log_info "即将把最优 DNS（$BEST_DNS）接管为系统 DNS..."
+  menu_apply perm
 }
 
 # ============================================================
@@ -1152,6 +1235,12 @@ run_unlock_check() {
   else
     log_warn "解锁检测脚本退出码: $exit_code"
   fi
+
+  echo ""
+  printf '%b\n' "${BOLD}下一步：${NC}"
+  echo "  · 若未解锁 → 回到控制台为本机 IP 勾选要解锁的服务与节点，"
+  echo "    然后重新运行本项「流媒体解锁检测」复测。"
+  echo "  · 控制台： $CONSOLE_URL"
 }
 
 # ============================================================
@@ -1211,26 +1300,31 @@ show_banner() {
   echo " /_/   \\_\\_|\\_\\____/|_| \\_|____) |"
   echo "                                   "
   printf '%b\n' "${NC}"
-  printf '%b\n' " ${BOLD}AKDNS v${VERSION}${NC} - 智能 DNS 测速与管理工具"
+  printf '%b\n' " ${BOLD}AKDNS v${VERSION}${NC} - 智能 DNS 测速与系统接管工具"
   echo " ========================================="
-  printf '%b\n' " 系统     : ${GREEN}$DISTRO_NAME $DISTRO_VERSION${NC}"
-  echo " init     : $INIT_SYSTEM"
-  echo " DNS 后端 : $DNS_BACKEND_PERM"
-  echo " 当前 DNS : $(get_current_dns)"
+  printf '%b\n' " 系统       : ${GREEN}$DISTRO_NAME $DISTRO_VERSION${NC}"
+  echo " init       : $INIT_SYSTEM"
+  echo " 当前 DNS 后端 : $DNS_BACKEND_PERM"
+  echo " 当前 DNS   : $(get_current_dns)"
+  printf '%b\n' " 接管目标   : ${GREEN}直接读取 /etc/resolv.conf${NC}（设为系统 DNS 时生效）"
   echo " ========================================="
 }
 
 show_menu() {
   echo ""
+  printf '%b\n' " ${BOLD}推荐流程:${NC} ①控制台添加本机 IP → ②测解锁(基线) → ③测 DNS → ④设为系统 DNS → ⑤控制台配置分服务 → ⑥复测解锁"
+  echo ""
   printf '%b\n' " ${BOLD}请选择操作:${NC}"
   echo ""
-  printf '%b\n' "  ${GREEN}1)${NC} DNS 测速"
-  printf '%b\n' "  ${GREEN}2)${NC} 应用 DNS (临时 - 重启失效)"
-  printf '%b\n' "  ${GREEN}3)${NC} 应用 DNS (永久 - 重启保留)"
-  printf '%b\n' "  ${GREEN}4)${NC} 备份当前 DNS 配置"
-  printf '%b\n' "  ${GREEN}5)${NC} 还原 DNS 配置"
-  printf '%b\n' "  ${GREEN}6)${NC} 查看当前状态"
-  printf '%b\n' "  ${GREEN}7)${NC} 流媒体解锁检测"
+  printf '%b\n' "  ${GREEN}1)${NC} 流媒体解锁检测                    ${CYAN}(步骤 ②/⑥)${NC}"
+  printf '%b\n' "  ${GREEN}2)${NC} DNS 测速 / 连通性测试              ${CYAN}(步骤 ③)${NC}"
+  printf '%b\n' "  ${GREEN}3)${NC} 设为系统 DNS (永久·接管 resolv.conf) ${CYAN}(步骤 ④)${NC}"
+  printf '%b\n' "  ${GREEN}4)${NC} 一键: 测速并设为系统 DNS          ${CYAN}(③+④)${NC}"
+  echo ""
+  printf '%b\n' "  ${GREEN}5)${NC} 临时设置 DNS (重启失效)"
+  printf '%b\n' "  ${GREEN}6)${NC} 备份当前 DNS 配置"
+  printf '%b\n' "  ${GREEN}7)${NC} 还原 DNS 配置 (撤销接管 / 回滚)"
+  printf '%b\n' "  ${GREEN}8)${NC} 查看当前状态"
   printf '%b\n' "  ${RED}0)${NC} 退出"
   echo ""
 }
@@ -1243,7 +1337,11 @@ main() {
   # 处理命令行参数
   case "${1:-}" in
     --help|-h)
-      echo "AKDNS v$VERSION - 智能 DNS 测速与管理工具"
+      echo "AKDNS v$VERSION - 智能 DNS 测速与系统接管工具"
+      echo ""
+      echo "测试 DNS 连通性 → 选出最优 AKDNS → 接管系统 DNS。"
+      echo "无论 netplan / systemd-resolved / NetworkManager / resolvconf，"
+      echo "一律收敛为「直接读取 /etc/resolv.conf」，确保流媒体解锁一定生效。"
       echo ""
       echo "用法: $(basename "$0") [选项]"
       echo ""
@@ -1252,6 +1350,7 @@ main() {
       echo "  --version, -v    显示版本号"
       echo ""
       echo "无参数运行时进入交互式菜单模式。"
+      echo "原 DNS 配置会在接管前自动备份，可用菜单「还原 DNS 配置」一键回滚。"
       exit 0
       ;;
     --version|-v)
@@ -1290,24 +1389,25 @@ main() {
     show_banner
     show_menu
     local choice
-    read -r -p " 请选择 [0-7]: " choice
+    read -r -p " 请选择 [0-8]: " choice
     case "$choice" in
-      1) run_speed_test ;;
-      2) menu_apply temp ;;
+      1) run_unlock_check ;;
+      2) run_speed_test ;;
       3) menu_apply perm ;;
-      4)
+      4) run_test_and_apply ;;
+      5) menu_apply temp ;;
+      6)
         require_root && do_backup "manual"
         ;;
-      5) do_restore ;;
-      6) show_status ;;
-      7) run_unlock_check ;;
+      7) do_restore ;;
+      8) show_status ;;
       0)
         clear
         log_info "再见！"
         exit 0
         ;;
       *)
-        log_warn "无效选择，请输入 0-7"
+        log_warn "无效选择，请输入 0-8"
         ;;
     esac
     press_enter
