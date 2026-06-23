@@ -30,6 +30,7 @@ LOCK_RESOLV_CONF=true
 
 # AKDNS 控制台地址（用于脚本内提示）
 CONSOLE_URL="https://dns.akile.ai/console"
+AKDNS_TG_URL="https://t.me/+MEKKEBUkW6ZjMzBl"
 
 DNS_LIST=(
   "66.66.66.66"
@@ -1749,14 +1750,16 @@ inject_akdns_unlock_context() {
   local patch_tmp
   patch_tmp=$(mktemp /tmp/akdns-unlock-check-patched.XXXXXX) || return 1
 
-  if awk -v console="$CONSOLE_URL" '
+  if awk -v console="$CONSOLE_URL" -v akdns_tg="$AKDNS_TG_URL" '
     function emit_context() {
       print "    if [[ \"${language:-}\" == \"e\" ]]; then"
       print "        echo -e \"${Font_Green}AKDNS:${Font_Suffix} ${Font_Yellow}Smart DNS unlock routing / Console: " console " ${Font_Suffix}\""
+      print "        echo -e \"${Font_Green}AKDNS Telegram:${Font_Suffix} ${Font_Yellow}" akdns_tg " ${Font_Suffix}\""
       print "        echo -e \"${Font_Yellow}This runtime copy was downloaded from 1-stream/RegionRestrictionCheck and patched by AKDNS to show AKDNS context; detection logic and results remain third-party reference output.${Font_Suffix}\""
       print "        echo \"\""
       print "    else"
       print "        echo -e \"${Font_Green}AKDNS:${Font_Suffix} ${Font_Yellow}智能 DNS 流媒体解锁分流 / 控制台：" console " ${Font_Suffix}\""
+      print "        echo -e \"${Font_Green}AKDNS TG 群组:${Font_Suffix} ${Font_Yellow}" akdns_tg " ${Font_Suffix}\""
       print "        echo -e \"${Font_Yellow}当前临时脚本下载自 1-stream/RegionRestrictionCheck，并由 AKDNS 运行时注入说明；检测逻辑与结果仍为第三方脚本参考输出。${Font_Suffix}\""
       print "        echo \"\""
       print "    fi"
