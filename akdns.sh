@@ -388,6 +388,10 @@ MSG[zh.downloading_unlock]="正在下载解锁检测脚本..."
 MSG[en.downloading_unlock]="Downloading the streaming unlock-check script..."
 MSG[zh.unlock_third_party_notice]="提示：流媒体解锁检测使用第三方开源脚本（1-stream/RegionRestrictionCheck），检测脚本与结果非 AKDNS 官方。"
 MSG[en.unlock_third_party_notice]="Notice: Streaming unlock check uses a third-party open-source script (1-stream/RegionRestrictionCheck); the script and results are not official AKDNS output."
+MSG[zh.injecting_unlock_context]="正在向第三方检测脚本注入 AKDNS 信息..."
+MSG[en.injecting_unlock_context]="Injecting AKDNS context into the third-party unlock-check script..."
+MSG[zh.inject_unlock_context_fail]="注入 AKDNS 信息失败，已中止执行，避免运行未标注的第三方检测脚本"
+MSG[en.inject_unlock_context_fail]="Failed to inject AKDNS context; aborted to avoid running an unlabelled third-party check script"
 MSG[zh.download_unlock_fail]="下载解锁检测脚本失败，请检查网络连接"
 MSG[en.download_unlock_fail]="Failed to download the unlock-check script; please check your network"
 MSG[zh.download_empty]="下载的脚本内容为空"
@@ -1740,6 +1744,47 @@ run_test_and_apply() {
 # 流媒体解锁检测
 # ============================================================
 
+inject_akdns_unlock_context() {
+  local script_path="$1"
+  local patch_tmp
+  patch_tmp=$(mktemp /tmp/akdns-unlock-check-patched.XXXXXX) || return 1
+
+  if awk -v console="$CONSOLE_URL" '
+    function emit_context() {
+      print "    if [[ \"${language:-}\" == \"e\" ]]; then"
+      print "        echo -e \"${Font_Green}AKDNS:${Font_Suffix} ${Font_Yellow}Smart DNS unlock routing / Console: " console " ${Font_Suffix}\""
+      print "        echo -e \"${Font_Yellow}This runtime copy was downloaded from 1-stream/RegionRestrictionCheck and patched by AKDNS to show AKDNS context; detection logic and results remain third-party reference output.${Font_Suffix}\""
+      print "        echo \"\""
+      print "    else"
+      print "        echo -e \"${Font_Green}AKDNS:${Font_Suffix} ${Font_Yellow}智能 DNS 流媒体解锁分流 / 控制台：" console " ${Font_Suffix}\""
+      print "        echo -e \"${Font_Yellow}当前临时脚本下载自 1-stream/RegionRestrictionCheck，并由 AKDNS 运行时注入说明；检测逻辑与结果仍为第三方脚本参考输出。${Font_Suffix}\""
+      print "        echo \"\""
+      print "    fi"
+    }
+    {
+      if ($0 ~ /\[商家\]TG群组/) {
+        sub(/\[商家\]TG群组/, "第三方脚本 TG 群组（非 AKDNS 官方群）")
+      }
+      print
+      if (!done && $0 ~ /^function ScriptTitle\(\)[[:space:]]*\{/) {
+        emit_context()
+        done = 1
+      }
+    }
+    END {
+      if (!done) {
+        exit 42
+      }
+    }
+  ' "$script_path" > "$patch_tmp"; then
+    mv "$patch_tmp" "$script_path"
+    return 0
+  fi
+
+  rm -f "$patch_tmp"
+  return 1
+}
+
 run_unlock_check() {
   if ! command -v curl &>/dev/null; then
     log_error "$(t curl_not_found)"
@@ -1770,6 +1815,12 @@ run_unlock_check() {
   # 验证下载内容非空
   if [[ ! -s "$tmp_script" ]]; then
     log_error "$(t download_empty)"
+    return 1
+  fi
+
+  log_info "$(t injecting_unlock_context)"
+  if ! inject_akdns_unlock_context "$tmp_script"; then
+    log_error "$(t inject_unlock_context_fail)"
     return 1
   fi
 
