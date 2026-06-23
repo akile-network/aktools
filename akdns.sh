@@ -267,6 +267,8 @@ MSG[zh.resolvectl_set]="通过 resolvectl 临时设置 DNS (接口: %s)..."
 MSG[en.resolvectl_set]="Setting DNS temporarily via resolvectl (interface: %s)..."
 MSG[zh.resolvectl_set_fail]="resolvectl 设置 DNS 失败"
 MSG[en.resolvectl_set_fail]="resolvectl failed to set DNS"
+MSG[zh.temp_tcp_direct_resolv]="TCP DNS 需要写入 options use-vc，临时模式将直接写入 /etc/resolv.conf"
+MSG[en.temp_tcp_direct_resolv]="TCP DNS requires 'options use-vc'; temporary mode will write /etc/resolv.conf directly"
 MSG[zh.temp_nm_note]="临时修改 DNS (NetworkManager 重启后恢复)..."
 MSG[en.temp_nm_note]="Changing DNS temporarily (NetworkManager reverts after a restart)..."
 MSG[zh.resolv_symlink_use_resolvectl]="/etc/resolv.conf 是 systemd 符号链接，使用 resolvectl 替代"
@@ -333,6 +335,8 @@ MSG[zh.speed_test_no_result]="测速未获取到结果"
 MSG[en.speed_test_no_result]="The speed test returned no result"
 MSG[zh.enter_dns]="请输入 DNS 地址: "
 MSG[en.enter_dns]="Enter a DNS address: "
+MSG[zh.manual_force_tcp_prompt]="手动输入的 DNS 是否强制走 TCP（写入 options use-vc）?"
+MSG[en.manual_force_tcp_prompt]="Force the manually entered DNS to use TCP (write 'options use-vc')?"
 MSG[zh.invalid_ipv4]="无效的 IPv4 地址: %s"
 MSG[en.invalid_ipv4]="Invalid IPv4 address: %s"
 MSG[zh.op_summary]="操作摘要:"
@@ -1447,6 +1451,15 @@ apply_temp() {
   local dns_ip="$1"
   local iface
 
+  if ${DNS_USE_TCP:-false}; then
+    log_info "$(t temp_tcp_direct_resolv)"
+    if ! safe_write_resolv_conf "$dns_ip"; then
+      log_error "$(t write_resolv_fail)"
+      return 1
+    fi
+    return 0
+  fi
+
   case "$DNS_BACKEND_TEMP" in
     systemd-resolved)
       iface=$(get_primary_interface)
@@ -1663,6 +1676,10 @@ menu_apply() {
         if ! validate_ipv4 "$target_dns"; then
           log_error "$(t invalid_ipv4 "$target_dns")"
           return 1
+        fi
+        DNS_USE_TCP=false
+        if confirm_action "$(t manual_force_tcp_prompt)"; then
+          DNS_USE_TCP=true
         fi
         ;;
       *)
